@@ -1,0 +1,8 @@
+Variable_Name,Census_Code,Description,Data_Source,Geography_Level
+total_pop,B01003_001,Total population - Count of all people in geographic area,ACS 5-Year 2022,Block Group
+race_white,B02001_002,White alone population - People identifying as White alone,ACS 5-Year 2022,Block Group
+race_black,B02001_003,Black or African American alone population - People identifying as Black alone,ACS 5-Year 2022,Block Group
+hispanic,B03002_012,Hispanic or Latino population - People of Hispanic or Latino origin,ACS 5-Year 2022,Block Group
+med_income,B19013_001,Median household income - Middle value of household income distribution,ACS 5-Year 2022,Block Group
+hh_size,B25010_001,Average household size - Mean number of people per household,ACS 5-Year 2022,Block Group
+owner_occupied,B25003_002,Owner-occupied housing units - Homes owned by residents,ACS 5-Year 2022,Block Group

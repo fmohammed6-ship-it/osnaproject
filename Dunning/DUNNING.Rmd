@@ -1,0 +1,1085 @@
+---
+title: "OSNAHW4"
+output: pdf_document
+pdf_document:
+    latex_engine: xelatex
+date: "2025-10-29"
+
+  
+---
+
+```{r abc}
+library(igraph)
+library(janitor)
+library(ggraph)
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(tigris)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+library(patchwork)
+library(ggcorrplot)
+
+# Load community area boundaries and filter for Dunning
+ca_sf <- st_read("/Users/mohammedfawwazuddin/Desktop/dunning_ca/data/raw/community_areas/Boundaries - Community Areas_20251027")
+dunning_sf <- ca_sf %>% filter(community == "DUNNING" | area_num_1 == 17)
+plot(st_geometry(dunning_sf), main = "Dunning Community Area")
+
+# Tract mapping from official Chicago data
+ca_tract_mapping <- data.frame(
+  tract = c("170100", "170200", "170300", "170400", "170500", 
+            "170600", "170700", "170800", "170900", "171000", "171100"),
+  community_area = "Dunning",
+  area_num_1 = 17
+) %>%
+  mutate(
+    GEOID_tract = paste0("17031", tract),
+    GEOID_bg_prefix = paste0("17031", tract)
+  )
+
+cat("Dunning Community Area contains", nrow(ca_tract_mapping), "census tracts\n")
+
+# Define census variables for analysis
+my_vars_2020 <- c(
+  total_pop = "P1_001N",
+  race_white = "P2_003N",
+  race_black = "P2_004N",
+  hispanic = "P2_010N"
+)
+
+my_vars_2010 <- c(
+  total_pop = "P001001",
+  race_white = "P003002",
+  race_black = "P003003",
+  hispanic = "P004003"
+)
+
+# Get decennial census data for Cook County
+cook_bg_2020 <- get_decennial(
+  geography = "block group",
+  variables = my_vars_2020,
+  year = 2020,
+  state = "IL",
+  county = "Cook",
+  geometry = TRUE,
+  output = "wide"
+)
+
+cook_bg_2010 <- get_decennial(
+  geography = "block group",
+  variables = my_vars_2010,
+  year = 2010,
+  state = "IL",
+  county = "Cook",
+  geometry = TRUE,
+  output = "wide"
+)
+
+# Transform CRS to match Dunning boundaries
+cook_bg_2020 <- st_transform(cook_bg_2020, st_crs(dunning_sf))
+cook_bg_2010 <- st_transform(cook_bg_2010, st_crs(dunning_sf))
+
+# Filter for Dunning block groups using tract mapping
+dunning_bg_2020 <- cook_bg_2020 %>%
+  mutate(tract_code = substr(GEOID, 1, 11)) %>%
+  filter(tract_code %in% ca_tract_mapping$GEOID_tract)
+
+dunning_bg_2010 <- cook_bg_2010 %>%
+  mutate(tract_code = substr(GEOID, 1, 11)) %>%
+  filter(tract_code %in% ca_tract_mapping$GEOID_tract)
+
+# Calculate summary statistics for Dunning
+dunning_summary_2020 <- dunning_bg_2020 %>%
+  st_drop_geometry() %>%
+  summarize(
+    total_pop = sum(total_pop, na.rm = TRUE),
+    pct_white = (sum(race_white, na.rm = TRUE) / sum(total_pop, na.rm = TRUE)) * 100,
+    pct_black = (sum(race_black, na.rm = TRUE) / sum(total_pop, na.rm = TRUE)) * 100,
+    pct_hispanic = (sum(hispanic, na.rm = TRUE) / sum(total_pop, na.rm = TRUE)) * 100
+  ) %>%
+  mutate(year = "2020")
+
+dunning_summary_2010 <- dunning_bg_2010 %>%
+  st_drop_geometry() %>%
+  summarize(
+    total_pop = sum(total_pop, na.rm = TRUE),
+    pct_white = (sum(race_white, na.rm = TRUE) / sum(total_pop, na.rm = TRUE)) * 100,
+    pct_black = (sum(race_black, na.rm = TRUE) / sum(total_pop, na.rm = TRUE)) * 100,
+    pct_hispanic = (sum(hispanic, na.rm = TRUE) / sum(total_pop, na.rm = TRUE)) * 100
+  ) %>%
+  mutate(year = "2010")
+
+# 2010 vs 2020 demographics
+dunning_comparison <- bind_rows(dunning_summary_2010, dunning_summary_2020)
+print(dunning_comparison)
+
+# Demographic comparison plot
+dunning_plot_data <- dunning_comparison %>%
+  select(year, pct_white, pct_black, pct_hispanic) %>%
+  pivot_longer(cols = -year, names_to = "demographic", values_to = "percentage") %>%
+  mutate(demographic = case_when(
+    demographic == "pct_white" ~ "White",
+    demographic == "pct_black" ~ "Black",
+    demographic == "pct_hispanic" ~ "Hispanic"
+  ))
+
+ggplot(dunning_plot_data, aes(x = demographic, y = percentage, fill = year)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_manual(values = c("2010" = "steelblue", "2020" = "darkorange")) +
+  labs(title = "Demographic Change in Dunning Community Area (2010-2020)",
+       subtitle = "Comparison using Decennial Census Block Group Data",
+       x = "Demographic Group",
+       y = "Percentage of Population (%)",
+       fill = "Census Year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+# Get income data from ACS to supplement decennial data
+acs_income_2020 <- get_acs(
+  geography = "block group",
+  variables = c(med_income = "B19013_001"),
+  year = 2020,
+  state = "IL",
+  county = "Cook",
+  geometry = TRUE,
+  output = "wide"
+)
+acs_income_2020 <- st_transform(acs_income_2020, st_crs(dunning_sf))
+
+dunning_income_2020 <- acs_income_2020 %>%
+  mutate(tract_code = substr(GEOID, 1, 11)) %>%
+  filter(tract_code %in% ca_tract_mapping$GEOID_tract)
+
+# Join income data with demographic data for mapping
+dunning_bg_2020_joined <- dunning_bg_2020 %>%
+  left_join(st_drop_geometry(dunning_income_2020)[, c("GEOID", "med_incomeE")], by = "GEOID")
+
+bg_plot_data <- dunning_bg_2020_joined %>%
+  mutate(
+    pct_white = (race_white / total_pop) * 100,
+    pct_black = (race_black / total_pop) * 100,
+    pct_hispanic = (hispanic / total_pop) * 100
+  )
+
+# Map showing white population distribution
+p1 <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black") +
+  geom_sf(data = bg_plot_data, aes(fill = pct_white), color = "white") +
+  scale_fill_viridis_c(name = "White (%)") +
+  labs(title = "Percent White by Block Group (2020)") +
+  theme_void()
+
+# Maps for black population
+p2 <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black") +
+  geom_sf(data = bg_plot_data, aes(fill = pct_black), color = "white") +
+  scale_fill_viridis_c(name = "Black (%)") +
+  labs(title = "Percent Black by Block Group (2020)") +
+  theme_void()
+
+#Map for income distribution
+p3 <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black") +
+  geom_sf(data = bg_plot_data, aes(fill = med_incomeE), color = "white") +
+  scale_fill_viridis_c(name = "Median Income ($)", labels = scales::dollar) +
+  labs(title = "Median Income by Block Group (ACS 2020 5-year)") +
+  theme_void()
+
+# Display all three maps together for comparison
+p1 + p2 + p3 + plot_layout(ncol = 2)
+
+# Prepare data for population comparison between 2010 and 2020
+pop_2010_data <- dunning_bg_2010 %>% mutate(year = "2010")
+pop_2020_data <- dunning_bg_2020 %>% mutate(year = "2020")
+
+all_pop_data <- bind_rows(pop_2010_data, pop_2020_data)
+
+# Population maps for both years
+pop_map_2010 <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black", linewidth = 1.2) +
+  geom_sf(data = pop_2010_data, aes(fill = total_pop), color = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(
+    name = "Population",
+    option = "plasma",
+    breaks = c(500, 1000, 1500, 2000, 2500, 3000),
+    labels = scales::comma,
+    trans = "sqrt"
+  ) +
+  labs(title = "Population by Block Group - 2010",
+       subtitle = paste("Total Population:", scales::comma(sum(pop_2010_data$total_pop, na.rm = TRUE))),
+       caption = "Source: 2010 Decennial Census") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    legend.position = "right"
+  )
+
+pop_map_2020 <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black", linewidth = 1.2) +
+  geom_sf(data = pop_2020_data, aes(fill = total_pop), color = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(
+    name = "Population",
+    option = "plasma",
+    breaks = c(500, 1000, 1500, 2000, 2500, 3000),
+    labels = scales::comma,
+    trans = "sqrt"  
+  ) +
+  labs(title = "Population by Block Group - 2020",
+       subtitle = paste("Total Population:", scales::comma(sum(pop_2020_data$total_pop, na.rm = TRUE))),
+       caption = "Source: 2020 Decennial Census") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    legend.position = "right"
+  )
+
+cat("POPULATION DISTRIBUTION COMPARISON: 2010 vs 2020\n")
+
+print(pop_map_2010)
+print(pop_map_2020)
+
+# Side-by-side comparison of population maps
+population_comparison <- pop_map_2010 + pop_map_2020 +
+  plot_annotation(
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      plot.subtitle = element_text(hjust = 0.5, size = 12)
+    )
+  )
+
+print(population_comparison)
+
+# Analyze population changes between 2010 and 2020
+population_change_analysis <- dunning_bg_2020 %>%
+  st_drop_geometry() %>%
+  select(GEOID, total_pop_2020 = total_pop) %>%
+  left_join(
+    dunning_bg_2010 %>% 
+      st_drop_geometry() %>% 
+      select(GEOID, total_pop_2010 = total_pop),
+    by = "GEOID"
+  ) %>%
+  mutate(
+    population_change = total_pop_2020 - total_pop_2010,
+    percent_change = (population_change / total_pop_2010) * 100
+  )
+
+print("Population Change Summary by Block Group:")
+print(population_change_analysis)
+
+# Calculate and display population change summary
+cat("Total Population 2010:", sum(dunning_bg_2010$total_pop, na.rm = TRUE), "\n")
+cat("Total Population 2020:", sum(dunning_bg_2020$total_pop, na.rm = TRUE), "\n")
+cat("Net Population Change:", sum(dunning_bg_2020$total_pop, na.rm = TRUE) - sum(dunning_bg_2010$total_pop, na.rm = TRUE), "\n")
+cat("Percent Change:", round(((sum(dunning_bg_2020$total_pop, na.rm = TRUE) - sum(dunning_bg_2010$total_pop, na.rm = TRUE)) / sum(dunning_bg_2010$total_pop, na.rm = TRUE)) * 100, 1), "%\n")
+
+# Compare block group counts between years
+cat("Number of block groups in 2010:", nrow(dunning_bg_2010), "\n")
+cat("Number of block groups in 2020:", nrow(dunning_bg_2020), "\n")
+cat("Difference:", nrow(dunning_bg_2020) - nrow(dunning_bg_2010), "block groups\n")
+
+# Identify block groups with significant population changes
+significant_changes <- population_change_analysis %>%
+  filter(abs(percent_change) > 10) 
+
+# Part 2: ACS Variable Selection and Justification
+
+# Define 7 ACS variables for detailed community analysis
+acs_vars_2022 <- c(
+  total_pop = "B01003_001",
+  race_white = "B02001_002", 
+  race_black = "B02001_003",  
+  hispanic = "B03002_012",
+  med_income = "B19013_001",
+  hh_size = "B25010_001",
+  owner_occupied = "B25003_002",
+  renter_occupied = "B25003_003"
+)
+
+# Get latest ACS data for Cook County block groups
+cook_bg_acs_2022 <- get_acs(
+  geography = "block group",
+  variables = acs_vars_2022,
+  year = 2022,
+  survey = "acs5",
+  state = "IL",
+  county = "Cook",
+  geometry = TRUE,
+  output = "wide"
+)
+
+# Transform and filter for Dunning block groups
+cook_bg_acs_2022 <- st_transform(cook_bg_acs_2022, st_crs(dunning_sf))
+dunning_bg_acs_2022 <- cook_bg_acs_2022 %>%
+  mutate(tract_code = substr(GEOID, 1, 11)) %>%
+  filter(tract_code %in% ca_tract_mapping$GEOID_tract)
+
+# Calculate housing tenure percentages
+dunning_bg_acs_2022 <- dunning_bg_acs_2022 %>%
+  mutate(
+    total_housing = owner_occupiedE + renter_occupiedE,
+    pct_owner_occupied = ifelse(total_housing > 0, (owner_occupiedE / total_housing) * 100, NA)
+  )
+
+# Display geographic composition summary
+cat("Dunning Community Area (CA 17) geographic composition:\n")
+cat("•", nrow(ca_tract_mapping), "census tracts\n")
+cat("•", nrow(dunning_bg_2020), "census block groups (2020 Decennial)\n")
+cat("•", nrow(dunning_bg_2010), "census block groups (2010 Decennial)\n")
+cat("•", nrow(dunning_bg_acs_2022), "census block groups (2022 ACS)\n\n")
+
+# Document selected variables and their justifications
+selected_variables <- data.frame(
+  Variable_Name = c("total_pop", "race_white", "race_black", "hispanic", "med_income", "hh_size", "owner_occupied"),
+  Census_Code = c("B01003_001", "B02001_002", "B02001_003", "B03002_012", "B19013_001", "B25010_001", "B25003_002"),
+  Description = c(
+    "Total population - Count of all people in geographic area",
+    "White alone population - People identifying as White alone",
+    "Black or African American alone population - People identifying as Black alone", 
+    "Hispanic or Latino population - People of Hispanic or Latino origin",
+    "Median household income - Middle value of household income distribution",
+    "Average household size - Mean number of people per household",
+    "Owner-occupied housing units - Homes owned by residents"
+  ),
+  Data_Source = rep("ACS 5-Year 2022", 7),
+  Geography_Level = rep("Block Group", 7)
+)
+
+print(selected_variables)
+write_csv(selected_variables, "dunning_acs_variable_descriptions.csv")
+
+# Analyze data quality and completeness
+cat("1. DATA AVAILABILITY ANALYSIS:\n")
+cat("-----------------------------\n")
+
+missing_analysis <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  summarise(across(c(total_popE, race_whiteE, race_blackE, hispanicE, med_incomeE, hh_sizeE, owner_occupiedE), list(missing = ~sum(is.na(.)),complete = ~sum(!is.na(.)),pct_missing = ~mean(is.na(.)) * 100)))
+
+print("Missing value analysis for 2022 ACS data:")
+print(missing_analysis)
+
+# Analyze statistical distributions of ACS variables
+cat("\nVARIABLE DISTRIBUTION ANALYSIS:\n")
+
+distribution_summary <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  select(total_popE, race_whiteE, race_blackE, hispanicE, med_incomeE, hh_sizeE, owner_occupiedE) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n = n(),
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    cv = sd/mean * 100
+  )
+
+print("Distribution summary for ACS variables:")
+print(distribution_summary)
+
+# Measure spatial variation across block groups
+cat("\nSPATIAL VARIATION ANALYSIS:\n")
+
+spatial_variation <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_white = ifelse(total_popE > 0, (race_whiteE / total_popE) * 100, NA),
+    pct_black = ifelse(total_popE > 0, (race_blackE / total_popE) * 100, NA),
+    pct_hispanic = ifelse(total_popE > 0, (hispanicE / total_popE) * 100, NA),
+    pct_owner = ifelse(total_housing > 0, (owner_occupiedE / total_housing) * 100, NA)
+  ) %>%
+  summarise(
+    pop_range = max(total_popE, na.rm = TRUE) - min(total_popE, na.rm = TRUE),
+    income_range = max(med_incomeE, na.rm = TRUE) - min(med_incomeE, na.rm = TRUE),
+    white_pct_range = max(pct_white, na.rm = TRUE) - min(pct_white, na.rm = TRUE),
+    black_pct_range = max(pct_black, na.rm = TRUE) - min(pct_black, na.rm = TRUE),
+    hispanic_pct_range = max(pct_hispanic, na.rm = TRUE) - min(pct_hispanic, na.rm = TRUE),
+    owner_pct_range = max(pct_owner, na.rm = TRUE) - min(pct_owner, na.rm = TRUE)
+  )
+
+print("Spatial variation across Dunning block groups:")
+print(spatial_variation)
+
+# Visualizations of variable distributions
+
+p1 <- ggplot(dunning_bg_acs_2022, aes(x = total_popE)) +
+  geom_histogram(fill = "steelblue", alpha = 0.7, bins = 8) +
+  labs(title = "Total Population Distribution", x = "Population", y = "Count") +
+  theme_minimal()
+
+p2 <- ggplot(dunning_bg_acs_2022, aes(x = med_incomeE)) +
+  geom_histogram(fill = "darkorange", alpha = 0.7, bins = 8) +
+  labs(title = "Median Income Distribution", x = "Income ($)", y = "Count") +
+  scale_x_continuous(labels = scales::dollar) +
+  theme_minimal()
+
+p3 <- ggplot(dunning_bg_acs_2022, aes(x = pct_owner_occupied)) +
+  geom_histogram(fill = "forestgreen", alpha = 0.7, bins = 8) +
+  labs(title = "Homeownership Rate Distribution", x = "Percentage Owner-Occupied", y = "Count") +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+  theme_minimal()
+
+racial_composition <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_white = ifelse(total_popE > 0, (race_whiteE / total_popE) * 100, NA),
+    pct_black = ifelse(total_popE > 0, (race_blackE / total_popE) * 100, NA),
+    pct_hispanic = ifelse(total_popE > 0, (hispanicE / total_popE) * 100, NA)
+  ) %>%
+  select(pct_white, pct_black, pct_hispanic) %>%
+  pivot_longer(cols = everything(), names_to = "group", values_to = "percentage")
+
+p4 <- ggplot(racial_composition, aes(x = percentage, fill = group)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 8) +
+  labs(title = "Racial/Ethnic Composition Distribution", x = "Percentage", y = "Count") +
+  scale_fill_manual(
+    values = c("pct_white" = "#FF6B6B", "pct_black" = "#4ECDC4", "pct_hispanic" = "#45B7D1"),
+    labels = c("pct_white" = "White", "pct_black" = "Black", "pct_hispanic" = "Hispanic")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+variable_distributions <- (p1 + p2) / (p3 + p4) +
+  plot_annotation(title = "ACS Variable Distributions in Dunning Block Groups (2022 ACS 5-Year)")
+
+print(variable_distributions)
+
+ggsave("acs_variable_distributions.png", variable_distributions, width = 12, height = 10, dpi = 300)
+
+# Part 3: Network Analysis for Community Structure
+
+n_bg_dunning <- nrow(dunning_bg_acs_2022)
+cat("Number of block groups in Dunning:", n_bg_dunning, "\n")
+
+# Identify communities that border Dunning
+all_cas_sf <- ca_sf
+dunning_neighbors <- all_cas_sf %>%
+  st_filter(dunning_sf, .predicate = st_touches)
+
+cat("Dunning's neighboring community areas:\n")
+print(dunning_neighbors$community)
+
+# Get ACS data for neighboring areas
+neighbor_bg_2022 <- get_acs(
+  geography = "block group",
+  variables = acs_vars_2022,
+  year = 2022,
+  survey = "acs5",
+  state = "IL",
+  county = "Cook",
+  geometry = TRUE,
+  output = "wide"
+)
+
+neighbor_bg_2022 <- st_transform(neighbor_bg_2022, st_crs(dunning_sf))
+
+# Combine Dunning and neighbor block groups
+study_area <- bind_rows(dunning_sf, dunning_neighbors)
+study_bg_2022 <- st_intersection(neighbor_bg_2022, study_area)
+
+study_bg_combined <- bind_rows(
+  dunning_bg_acs_2022 %>% mutate(area_type = "Dunning"),
+  study_bg_2022 %>% 
+    filter(!GEOID %in% dunning_bg_acs_2022$GEOID) %>%
+    mutate(area_type = "Neighbor")
+)
+
+cat("Total block groups in study area (Dunning + neighbors):", nrow(study_bg_combined), "\n")
+
+# Prepare data for network analysis
+analysis_data <- study_bg_combined %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_white = ifelse(total_popE > 0, (race_whiteE / total_popE) * 100, NA),
+    pct_black = ifelse(total_popE > 0, (race_blackE / total_popE) * 100, NA),
+    pct_hispanic = ifelse(total_popE > 0, (hispanicE / total_popE) * 100, NA),
+    pct_owner = ifelse(total_housing > 0, (owner_occupiedE / total_housing) * 100, NA),
+    income_scaled = scale(med_incomeE)
+  ) %>%
+  select(GEOID, total_popE, pct_white, pct_black, pct_hispanic, income_scaled, hh_sizeE, pct_owner, area_type) %>%
+  drop_na()
+
+# Standardize variables for similarity calculation
+scaled_data <- analysis_data %>%
+  select(total_popE, pct_white, pct_black, pct_hispanic, income_scaled, hh_sizeE, pct_owner) %>%
+  scale() %>%
+  as.data.frame()
+
+rownames(scaled_data) <- analysis_data$GEOID
+
+cat("Final analysis dataset dimensions:", dim(scaled_data), "\n")
+cat("Variables used for similarity:", names(scaled_data), "\n")
+
+# Block group similarity network. Calculate similarity between block groups
+
+bg_distances <- dist(scaled_data, method = "euclidean")
+bg_similarity <- 1 / (1 + as.matrix(bg_distances))
+k <- 5
+adjacency_matrix <- matrix(0, nrow = nrow(bg_similarity), ncol = ncol(bg_similarity))
+
+for(i in 1:nrow(bg_similarity)) {
+  similar_indices <- order(bg_similarity[i,], decreasing = TRUE)[2:(k+1)]
+  adjacency_matrix[i, similar_indices] <- bg_similarity[i, similar_indices]
+  adjacency_matrix[similar_indices, i] <- bg_similarity[similar_indices, i]
+}
+
+bg_graph <- graph_from_adjacency_matrix(adjacency_matrix, mode = "undirected", weighted = TRUE)
+
+V(bg_graph)$GEOID <- analysis_data$GEOID
+V(bg_graph)$pct_white <- analysis_data$pct_white
+V(bg_graph)$pct_black <- analysis_data$pct_black
+V(bg_graph)$pct_hispanic <- analysis_data$pct_hispanic
+V(bg_graph)$income <- analysis_data$income_scaled
+V(bg_graph)$area_type <- analysis_data$area_type
+
+cat("Network created with", vcount(bg_graph), "vertices and", ecount(bg_graph), "edges\n")
+
+louvain_communities <- cluster_louvain(bg_graph)
+V(bg_graph)$louvain_community <- louvain_communities$membership
+
+cat("Detected", length(unique(louvain_communities$membership)), "communities via Louvain algorithm\n")
+modularity_score <- modularity(louvain_communities)
+cat("Network modularity:", round(modularity_score, 3), "\n")
+
+set.seed(123)
+layout <- create_layout(bg_graph, layout = "fr")
+
+network_plot <- ggraph(layout) +
+  geom_edge_link(alpha = 0.1, aes(width = weight)) +
+  geom_node_point(aes(color = as.factor(louvain_community), shape = area_type), size = 3, alpha = 0.7) +
+  scale_color_viridis_d(name = "Detected Community") +
+  scale_shape_manual(name = "Area Type", values = c(16, 17)) +
+  labs(title = "Block Group Similarity Network - Dunning and Neighbors",
+       subtitle = paste("Colors show", length(unique(louvain_communities$membership)), "detected communities")) +
+  theme_void() +
+  theme(legend.position = "bottom")
+
+print(network_plot)
+ggsave("network_communities.png", network_plot, width = 12, height = 10, dpi = 300)
+
+community_comparison <- data.frame(
+  GEOID = V(bg_graph)$GEOID,
+  Detected_Community = V(bg_graph)$louvain_community,
+  Official_Area = V(bg_graph)$area_type
+) %>%
+  group_by(Detected_Community, Official_Area) %>%
+  summarise(Count = n(), .groups = "drop")
+
+print("Comparison between detected communities and official areas:")
+print(community_comparison)
+
+community_profiles <- analysis_data %>%
+  left_join(data.frame(GEOID = V(bg_graph)$GEOID, 
+                       Detected_Community = V(bg_graph)$louvain_community), by = "GEOID") %>%
+  group_by(Detected_Community) %>%
+  summarise(
+    n_block_groups = n(),
+    avg_pct_white = mean(pct_white, na.rm = TRUE),
+    avg_pct_black = mean(pct_black, na.rm = TRUE),
+    avg_pct_hispanic = mean(pct_hispanic, na.rm = TRUE),
+    avg_income = mean(income_scaled, na.rm = TRUE),
+    contains_dunning = any(area_type == "Dunning")
+  )
+
+print("Profiles of detected communities:")
+print(community_profiles)
+
+cat("\nARGUMENTS FOR DUNNING AS A COMMUNITY\n")
+
+dunning_vertices <- V(bg_graph)[area_type == "Dunning"]
+dunning_internal_edges <- E(bg_graph)[dunning_vertices %--% dunning_vertices]
+dunning_external_edges <- E(bg_graph)[dunning_vertices %--% V(bg_graph)[area_type != "Dunning"]]
+
+internal_density <- ifelse(length(dunning_internal_edges) > 0, 
+                           mean(dunning_internal_edges$weight, na.rm = TRUE), 0)
+external_density <- ifelse(length(dunning_external_edges) > 0, 
+                           mean(dunning_external_edges$weight, na.rm = TRUE), 0)
+
+cat("Internal similarity within Dunning:", round(internal_density, 3), "\n")
+cat("External similarity from Dunning to neighbors:", round(external_density, 3), "\n")
+cat("Cohesion ratio (internal/external):", 
+    ifelse(external_density > 0, round(internal_density/external_density, 2), "Infinite"), "\n")
+
+dunning_demographics <- analysis_data %>%
+  filter(area_type == "Dunning") %>%
+  select(pct_white, pct_black, pct_hispanic)
+
+dunning_variance <- apply(dunning_demographics, 2, var, na.rm = TRUE)
+neighbor_variance <- analysis_data %>%
+  filter(area_type != "Dunning") %>%
+  select(pct_white, pct_black, pct_hispanic) %>%
+  apply(2, var, na.rm = TRUE)
+
+variance_comparison <- data.frame(
+  Variable = names(dunning_variance),
+  Dunning_Variance = dunning_variance,
+  Neighbor_Variance = neighbor_variance,
+  Ratio = dunning_variance / neighbor_variance
+)
+
+print("Variance comparison (lower = more homogeneous):")
+print(variance_comparison)
+
+cat("\nARGUMENTS AGAINST DUNNING AS A COMMUNITY\n")
+
+dunning_communities <- community_comparison %>%
+  filter(Official_Area == "Dunning") %>%
+  group_by(Detected_Community) %>%
+  summarise(Count = sum(Count))
+
+cat("Dunning block groups are split across", nrow(dunning_communities), "detected communities\n")
+
+if(nrow(dunning_communities) > 1) {
+  cat("Dunning lacks internal cohesion as a single community\n")
+}
+
+boundary_strength <- ifelse(internal_density > 0, external_density / internal_density, Inf)
+cat("Boundary permeability index:", round(boundary_strength, 3), "\n")
+cat("Values closer to 1 indicate weak boundaries between Dunning and neighbors\n")
+
+cat("\nPROPOSAL FOR ALTERNATIVE COMMUNITY ORGANIZATION\n")
+
+proposed_communities <- community_profiles %>%
+  filter(n_block_groups >= 3) %>%
+  arrange(desc(n_block_groups))
+
+print("Proposed community organization based on network analysis:")
+print(proposed_communities %>% select(Detected_Community, n_block_groups, avg_pct_white, avg_pct_black, avg_pct_hispanic))
+
+proposal_data <- study_bg_combined %>%
+  left_join(data.frame(GEOID = V(bg_graph)$GEOID, 
+                       Community = V(bg_graph)$louvain_community), by = "GEOID") %>%
+  filter(Community %in% proposed_communities$Detected_Community)
+
+proposal_plot <- ggplot() +
+  geom_sf(data = study_area, fill = "lightgray", alpha = 0.3) +
+  geom_sf(data = proposal_data, aes(fill = as.factor(Community)), color = "white", alpha = 0.8) +
+  geom_sf(data = dunning_sf, fill = NA, color = "red", size = 1, linetype = "dashed") +
+  scale_fill_viridis_d(name = "Proposed Community") +
+  labs(title = "Proposed Community Organization Based on Network Analysis",
+       subtitle = paste("Based on demographic similarity across", nrow(proposed_communities), "detected communities"),
+       caption = "Dashed red line shows current Dunning boundary") +
+  theme_void()
+
+print(proposal_plot)
+ggsave("proposed_communities.png", proposal_plot, width = 10, height = 8, dpi = 300)
+
+cat("\nSUMMARY AND CONCLUSIONS\n")
+
+dunning_cohesion <- ifelse(internal_density > external_density, "High", "Low")
+boundary_strength_assessment <- ifelse(boundary_strength < 0.5, "Strong", "Weak")
+community_unity <- ifelse(nrow(dunning_communities) == 1, "Unified", "Fragmented")
+
+cat("FINAL ASSESSMENT OF DUNNING AS A COMMUNITY:\n")
+cat("• Internal cohesion:", dunning_cohesion, "\n")
+cat("• Boundary strength:", boundary_strength_assessment, "\n") 
+cat("• Community unity:", community_unity, "\n")
+cat("• Network modularity:", round(modularity_score, 3), "\n")
+cat("• Proposed communities:", nrow(proposed_communities), "\n\n")
+
+cat("DATA-BASED RECOMMENDATION:\n")
+if (dunning_cohesion == "High" && boundary_strength_assessment == "Strong" && community_unity == "Unified") {
+  cat("Dunning functions well as a single community\n")
+} else {
+  cat("The proposed", nrow(proposed_communities), "communities better reflect demographic patterns\n")
+}
+
+
+
+# Part 4: Airport Proximity Analysis
+
+# Load and prepare airport data
+# O'Hare International Airport coordinates (from public data)
+ohare_airport <- data.frame(
+  name = "O'Hare International Airport",
+  longitude = -87.9048,
+  latitude = 41.9786
+) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(st_crs(dunning_sf))
+
+# Calculate distance from each block group centroid to O'Hare
+dunning_bg_acs_2022 <- dunning_bg_acs_2022 %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    distance_to_ohare = as.numeric(st_distance(centroid, ohare_airport)) * 0.000621371, # Convert to miles
+    distance_km = as.numeric(st_distance(centroid, ohare_airport)) / 1000
+  )
+
+# Also calculate for the broader study area
+study_bg_combined <- study_bg_combined %>%
+  mutate(
+    centroid = st_centroid(geometry),
+    distance_to_ohare = as.numeric(st_distance(centroid, ohare_airport)) * 0.000621371,
+    distance_km = as.numeric(st_distance(centroid, ohare_airport)) / 1000
+  )
+
+# Analyze relationship between airport proximity and demographics
+distance_analysis <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  select(
+    GEOID, 
+    distance_to_ohare, 
+    total_popE, 
+    med_incomeE, 
+    pct_owner_occupied,
+    race_whiteE,
+    race_blackE,
+    hispanicE
+  ) %>%
+  mutate(
+    pct_white   = (race_whiteE / total_popE) * 100,
+    pct_black   = (race_blackE / total_popE) * 100,
+    pct_hispanic = (hispanicE / total_popE) * 100
+  ) %>%
+  select(
+    GEOID, distance_to_ohare, total_popE, med_incomeE,
+    pct_owner_occupied, pct_white, pct_black, pct_hispanic
+  )
+
+# Correlation analysis
+correlation_matrix <- distance_analysis %>%
+  select(distance_to_ohare, med_incomeE, pct_owner_occupied, pct_white, pct_black, pct_hispanic) %>%
+  cor(use = "complete.obs")
+
+print("Correlation between airport distance and demographic variables:")
+print(correlation_matrix)
+
+# Visualize correlation matrix
+corr_plot <- ggcorrplot(correlation_matrix, 
+                       method = "circle",
+                       colors = c("#6D9EC1", "white", "#E46726"),
+                       title = "Correlation: Airport Distance vs Demographics",
+                       lab = TRUE)
+
+# make sure it actually draws
+print(corr_plot)
+
+# Distance zones analysis
+distance_zones <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  mutate(
+    distance_zone = case_when(
+      distance_to_ohare < 3 ~ "0-3 miles",
+      distance_to_ohare < 5 ~ "3-5 miles", 
+      distance_to_ohare < 7 ~ "5-7 miles",
+      TRUE ~ "7+ miles"
+    ),
+    distance_zone = factor(distance_zone, levels = c("0-3 miles", "3-5 miles", "5-7 miles", "7+ miles"))
+  ) %>%
+  group_by(distance_zone) %>%
+  summarise(
+    n_block_groups = n(),
+    avg_distance = mean(distance_to_ohare),
+    avg_income = mean(med_incomeE, na.rm = TRUE),
+    avg_owner_occupied = mean(pct_owner_occupied, na.rm = TRUE),
+    avg_white = mean((race_whiteE / total_popE) * 100, na.rm = TRUE),
+    avg_black = mean((race_blackE / total_popE) * 100, na.rm = TRUE),
+    avg_hispanic = mean((hispanicE / total_popE) * 100, na.rm = TRUE),
+    total_population = sum(total_popE, na.rm = TRUE)
+  )
+
+print("Demographic patterns by distance from O'Hare:")
+print(distance_zones)
+
+# Visualization: Airport proximity maps
+
+# Map 1: Distance to O'Hare
+p_distance <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black", size = 1) +
+  geom_sf(data = dunning_bg_acs_2022, aes(fill = distance_to_ohare), color = "white", alpha = 0.8) +
+  geom_sf(data = ohare_airport, color = "red", size = 3, shape = 17) +
+  scale_fill_viridis_c(name = "Distance to O'Hare (miles)", direction = -1) +
+  labs(title = "Distance from O'Hare Airport by Block Group",
+       subtitle = "Red triangle shows O'Hare Airport location") +
+  theme_void() +
+  theme(legend.position = "bottom")
+
+# Map 2: Income vs Distance
+p_income_distance <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black", size = 1) +
+  geom_sf(data = dunning_bg_acs_2022, aes(fill = med_incomeE), color = "white", alpha = 0.8) +
+  geom_sf(data = ohare_airport, color = "red", size = 3, shape = 17) +
+  scale_fill_viridis_c(
+    name   = "Median Income",
+    labels = scales::label_dollar(scale = 0.001, suffix = "k")  # e.g., 60k, 80k
+  ) +
+  labs(
+    title    = "Median Income and Airport Proximity",
+    subtitle = "Red triangle shows O'Hare Airport location"
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    legend.title    = element_text(size = 9),
+    legend.text     = element_text(size = 8)
+  )
+
+# Map 3: Homeownership vs Distance
+p_owner_distance <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black", size = 1) +
+  geom_sf(data = dunning_bg_acs_2022, aes(fill = pct_owner_occupied), color = "white", alpha = 0.8) +
+  geom_sf(data = ohare_airport, color = "red", size = 3, shape = 17) +
+  scale_fill_viridis_c(name = "Owner-Occupied (%)") +
+  labs(title = "Homeownership Rates and Airport Proximity") +
+  theme_void() +
+  theme(legend.position = "bottom")
+
+# Display airport proximity maps separately (no patchwork)
+print(p_distance)
+print(p_income_distance)
+print(p_owner_distance)
+
+# Statistical models for airport proximity effects
+library(broom)
+
+# Model 1: Income vs Distance
+model_income <- lm(med_incomeE ~ distance_to_ohare, data = dunning_bg_acs_2022)
+print("Income vs Distance model:")
+print(summary(model_income))
+
+# Model 2: Homeownership vs Distance  
+model_owner <- lm(pct_owner_occupied ~ distance_to_ohare, data = dunning_bg_acs_2022)
+print("Homeownership vs Distance model:")
+print(summary(model_owner))
+
+# Model 3: Racial composition vs Distance
+model_white <- lm((race_whiteE/total_popE)*100 ~ distance_to_ohare, data = dunning_bg_acs_2022)
+print("White population % vs Distance model:")
+print(summary(model_white))
+
+# Scatter plots with regression lines
+scatter_data <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_white = (race_whiteE / total_popE) * 100,
+    pct_black = (race_blackE / total_popE) * 100,
+    pct_hispanic = (hispanicE / total_popE) * 100
+  )
+
+# Income vs Distance scatter
+p_scatter_income <- ggplot(scatter_data, aes(x = distance_to_ohare, y = med_incomeE)) +
+  geom_point(aes(size = total_popE), alpha = 0.6) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(title = "Median Income vs Distance to O'Hare",
+       x = "Distance to O'Hare (miles)",
+       y = "Median Household Income",
+       size = "Population") +
+  theme_minimal()
+
+# Homeownership vs Distance scatter
+p_scatter_owner <- ggplot(scatter_data, aes(x = distance_to_ohare, y = pct_owner_occupied)) +
+  geom_point(aes(size = total_popE), alpha = 0.6) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(title = "Homeownership vs Distance to O'Hare",
+       x = "Distance to O'Hare (miles)", 
+       y = "Percentage Owner-Occupied (%)",
+       size = "Population") +
+  theme_minimal()
+
+# White population vs Distance scatter
+p_scatter_white <- ggplot(scatter_data, aes(x = distance_to_ohare, y = pct_white)) +
+  geom_point(aes(size = total_popE), alpha = 0.6) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(title = "White Population % vs Distance to O'Hare",
+       x = "Distance to O'Hare (miles)",
+       y = "Percentage White (%)",
+       size = "Population") +
+  theme_minimal()
+
+# Print scatter plots individually (no combining)
+print(p_scatter_income)
+print(p_scatter_owner)
+print(p_scatter_white)
+
+# Integrate airport proximity into network analysis
+analysis_data_with_distance <- study_bg_combined %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_white = ifelse(total_popE > 0, (race_whiteE / total_popE) * 100, NA),
+    pct_black = ifelse(total_popE > 0, (race_blackE / total_popE) * 100, NA),
+    pct_hispanic = ifelse(total_popE > 0, (hispanicE / total_popE) * 100, NA),
+    pct_owner = ifelse(total_housing > 0, (owner_occupiedE / total_housing) * 100, NA),
+    income_scaled = scale(med_incomeE),
+    distance_scaled = scale(distance_to_ohare)
+  ) %>%
+  select(GEOID, total_popE, pct_white, pct_black, pct_hispanic, income_scaled, 
+         hh_sizeE, pct_owner, distance_scaled, area_type) %>%
+  drop_na()
+
+# Update similarity network with airport proximity
+scaled_data_with_distance <- analysis_data_with_distance %>%
+  select(total_popE, pct_white, pct_black, pct_hispanic, income_scaled, 
+         hh_sizeE, pct_owner, distance_scaled) %>%
+  scale() %>%
+  as.data.frame()
+
+rownames(scaled_data_with_distance) <- analysis_data_with_distance$GEOID
+
+# Create updated network with airport proximity
+bg_distances_updated <- dist(scaled_data_with_distance, method = "euclidean")
+bg_similarity_updated <- 1 / (1 + as.matrix(bg_distances_updated))
+
+adjacency_matrix_updated <- matrix(0, nrow = nrow(bg_similarity_updated), 
+                                  ncol = ncol(bg_similarity_updated))
+
+for(i in 1:nrow(bg_similarity_updated)) {
+  similar_indices <- order(bg_similarity_updated[i,], decreasing = TRUE)[2:(k+1)]
+  adjacency_matrix_updated[i, similar_indices] <- bg_similarity_updated[i, similar_indices]
+  adjacency_matrix_updated[similar_indices, i] <- bg_similarity_updated[similar_indices, i]
+}
+
+bg_graph_updated <- graph_from_adjacency_matrix(adjacency_matrix_updated, 
+                                               mode = "undirected", weighted = TRUE)
+
+V(bg_graph_updated)$GEOID <- analysis_data_with_distance$GEOID
+V(bg_graph_updated)$pct_white <- analysis_data_with_distance$pct_white
+V(bg_graph_updated)$pct_black <- analysis_data_with_distance$pct_black
+V(bg_graph_updated)$pct_hispanic <- analysis_data_with_distance$pct_hispanic
+V(bg_graph_updated)$income <- analysis_data_with_distance$income_scaled
+V(bg_graph_updated)$distance <- analysis_data_with_distance$distance_scaled
+V(bg_graph_updated)$area_type <- analysis_data_with_distance$area_type
+
+# Detect communities in updated network
+louvain_communities_updated <- cluster_louvain(bg_graph_updated)
+V(bg_graph_updated)$louvain_community <- louvain_communities_updated$membership
+
+cat("Updated network with airport proximity:\n")
+cat("Vertices:", vcount(bg_graph_updated), "Edges:", ecount(bg_graph_updated), "\n")
+cat("Detected communities:", length(unique(louvain_communities_updated$membership)), "\n")
+cat("Modularity:", round(modularity(louvain_communities_updated), 3), "\n")
+
+# Compare community detection with and without airport proximity
+community_comparison_updated <- data.frame(
+  GEOID = V(bg_graph_updated)$GEOID,
+  Detected_Community = V(bg_graph_updated)$louvain_community,
+  Official_Area = V(bg_graph_updated)$area_type
+) %>%
+  group_by(Detected_Community, Official_Area) %>%
+  summarise(Count = n(), .groups = "drop")
+
+print("Updated community detection with airport proximity:")
+print(community_comparison_updated)
+
+# Airport proximity impact summary
+cat("\nAIRPORT PROXIMITY IMPACT ANALYSIS\n")
+cat("==================================\n")
+
+# Key findings
+distance_stats <- dunning_bg_acs_2022 %>%
+  st_drop_geometry() %>%
+  summarise(
+    min_distance = min(distance_to_ohare, na.rm = TRUE),
+    max_distance = max(distance_to_ohare, na.rm = TRUE),
+    mean_distance = mean(distance_to_ohare, na.rm = TRUE),
+    median_distance = median(distance_to_ohare, na.rm = TRUE)
+  )
+
+print("Distance statistics for Dunning block groups:")
+print(distance_stats)
+
+# Airport proximity conclusions
+cat("\nCONCLUSIONS ABOUT AIRPORT PROXIMITY EFFECTS:\n")
+
+if(correlation_matrix["distance_to_ohare", "med_incomeE"] > 0.1) {
+  cat("• Positive correlation found: Income increases with distance from airport\n")
+} else if(correlation_matrix["distance_to_ohare", "med_incomeE"] < -0.1) {
+  cat("• Negative correlation found: Income decreases with distance from airport\n")
+} else {
+  cat("• Weak correlation between income and airport distance\n")
+}
+
+if(correlation_matrix["distance_to_ohare", "pct_owner_occupied"] > 0.1) {
+  cat("• Homeownership rates tend to be higher further from the airport\n")
+} else if(correlation_matrix["distance_to_ohare", "pct_owner_occupied"] < -0.1) {
+  cat("• Homeownership rates tend to be higher closer to the airport\n")
+} else {
+  cat("• Weak relationship between homeownership and airport distance\n")
+}
+
+# Save airport proximity data for further analysis
+write_csv(distance_analysis, "dunning_airport_proximity_analysis.csv")
+
+cat("\nAirport proximity analysis completed and saved.\n")
+
+
+
+
+
+
+library(scales)  # for rescale()
+
+# Ensure required variables exist:
+# dunning_bg_acs_2022 must have:
+#  - distance_to_ohare (miles)
+#  - med_incomeE (median income)
+#  - pct_owner_occupied (%)
+
+# 1. Create standardized (0–1) versions of the three variables
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(scales)
+
+# 1. Create SAFE scaled variables (no NAs, no out-of-range values)
+dunning_composite <- dunning_bg_acs_2022 %>%
+  mutate(
+    income_scaled = rescale(med_incomeE, to = c(0, 1), na.rm = TRUE),
+    owner_scaled  = rescale(pct_owner_occupied, to = c(0, 1), na.rm = TRUE),
+
+    # distance: flip so closer = more intense
+    dist_scaled_raw = rescale(distance_to_ohare, to = c(0, 1), na.rm = TRUE),
+    dist_scaled     = 1 - dist_scaled_raw,
+
+    # Replace all NA values with 0 (or a neutral mid value if you prefer)
+    income_scaled = ifelse(is.na(income_scaled), 0, income_scaled),
+    owner_scaled  = ifelse(is.na(owner_scaled), 0, owner_scaled),
+    dist_scaled   = ifelse(is.na(dist_scaled), 0, dist_scaled),
+
+    # Ensure all values are within 0–1 to avoid rgb() crash
+    income_scaled = pmin(pmax(income_scaled, 0), 1),
+    owner_scaled  = pmin(pmax(owner_scaled, 0), 1),
+    dist_scaled   = pmin(pmax(dist_scaled, 0), 1),
+
+    # Composite RGB color
+    composite_col = rgb(income_scaled, owner_scaled, dist_scaled)
+  )
+
+# 2. Single composite map for all 3 variables
+p_composite <- ggplot() +
+  geom_sf(data = dunning_sf, fill = NA, color = "black", size = 0.8) +
+  geom_sf(data = dunning_composite,
+          aes(fill = composite_col),
+          color = "white",
+          alpha = 0.95,
+          size = 0.1) +
+  geom_sf(data = ohare_airport,
+          color = "yellow",
+          fill  = "yellow",
+          size = 3,
+          shape = 23) +
+  scale_fill_identity(
+    name   = "Composite (R,G,B)",
+    guide  = "none"
+  ) +
+  labs(
+    title    = "Composite Map: Income, Homeownership, and Airport Proximity (Dunning)",
+    subtitle = "Red = higher income, Green = higher homeownership, Blue = closer to O'Hare"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+print(p_composite)
+
+```
