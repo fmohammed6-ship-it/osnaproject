@@ -1,0 +1,542 @@
+
+```{r}
+install.packages("sf", dependencies = TRUE)
+install.packages("tidycensus")
+library(tidycensus)
+```
+```{r}
+library(tidycensus)
+library(dplyr)
+library(janitor)
+
+
+existing_key <- Sys.getenv("CENSUS_API_KEY")
+
+if (existing_key != "") {
+  census_api_key(existing_key, install = FALSE)
+} else {
+  message("No Census API key found. Please set CENSUS_API_KEY in your ~/.Renviron or 
+           call census_api_key(\"YOUR_KEY\", install = FALSE).")
+}
+
+
+acs_2023_test <- get_acs(
+  geography = "tract",
+  variables = "B19013_001",  # median household income
+  state = "IL",
+  county = "Cook",
+  year = 2023
+)
+
+acs_2023_test <- acs_2023_test %>% clean_names()
+head(acs_2023_test)
+```
+
+```{r}
+library(tidycensus)
+library(dplyr)
+library(readr)
+library(readxl)
+library(tidyr)
+library(janitor)
+library(sf)
+library(ggplot2)
+library(purrr)
+```
+
+```{r define-vars}
+
+years <- c(2015, 2018, 2020, 2022)
+
+
+core_vars <- c(
+  total_pop     = "B01003_001",  
+  median_age    = "B01002_001",  
+  median_income = "B19013_001"    
+)
+
+edu_vars <- paste0("B15003_", sprintf("%03d", 1:25))  
+
+tenure_vars <- c(                     
+  b25003_total = "B25003_001",
+  owner_occ    = "B25003_002",
+  renter_occ   = "B25003_003"
+)
+
+pov_vars <- c(                       
+  b17001_total  = "B17001_001",
+  below_poverty = "B17001_002"
+)
+
+# Combine all variables
+all_vars <- c(core_vars, set_names(edu_vars, edu_vars), tenure_vars, pov_vars)
+```
+
+
+```{r get-bg-one-year}
+get_bg_one_year <- function(yr) {
+  message("Pulling ACS block-group data for year: ", yr)
+
+  bg <- get_acs(
+    geography = "block group",
+    variables = all_vars,
+    state = "IL",
+    county = "Cook",
+    year = yr,
+    geometry = TRUE
+  )
+
+  bg_wide <- bg %>%
+    rename_with(~tolower(.x)) %>%
+    select(geoid, name, variable, estimate, geometry) %>%
+    pivot_wider(names_from = variable, values_from = estimate) %>%
+    janitor::clean_names()
+
+
+  hs_cols <- paste0("b15003_", sprintf("%03d", 17:25))
+  ba_cols <- paste0("b15003_", sprintf("%03d", 22:25))
+
+  bg_wide <- bg_wide %>%
+    mutate(
+      edu_total = b15003_001,
+      hs_or_more_count = rowSums(across(all_of(hs_cols)), na.rm = TRUE),
+      bachelors_plus_count = rowSums(across(all_of(ba_cols)), na.rm = TRUE),
+      hs_or_more_pct = if_else(edu_total > 0, 100 * hs_or_more_count / edu_total, NA_real_),
+      bachelors_plus_pct = if_else(edu_total > 0, 100 * bachelors_plus_count / edu_total, NA_real_),
+      owner_occ_pct  = if_else(b25003_total > 0, 100 * owner_occ / b25003_total, NA_real_),
+      renter_occ_pct = if_else(b25003_total > 0, 100 * renter_occ / b25003_total, NA_real_),
+      poverty_pct    = if_else(b17001_total > 0, 100 * below_poverty / b17001_total, NA_real_),
+      year = yr
+    )
+
+  return(bg_wide)
+}
+```
+```{r get-all-forestglen}
+
+acs_bg_all <- purrr::map_dfr(years, get_bg_one_year)
+
+
+ca_cross <- readxl::read_excel("OSNA_FINAL/2020 Census Tracts to Chicago Community Area Equivalency File.xlsx") %>%
+  janitor::clean_names()
+
+fg_all <- acs_bg_all %>%
+  mutate(tract11 = substr(geoid, 1, 11)) %>%
+  inner_join(
+    ca_cross %>% transmute(tract11 = as.character(geoid20), ca),
+    by = "tract11"
+  ) %>%
+  filter(ca == 12)  
+
+
+nrow(fg_all)
+unique(fg_all$year)
+```
+
+```{r setup-years-vars}
+# 4 ACS 5-year estimate windows
+years <- c(2015, 2018, 2020, 2022)
+
+# We'll track these 7 key indicators:
+core_vars <- c(
+  total_pop     = "B01003_001",   # Total population
+  median_age    = "B01002_001",   # Median age
+  median_income = "B19013_001"    # Median household income
+)
+
+edu_vars <- paste0("B15003_", sprintf("%03d", 1:25))  # Education breakdown
+
+tenure_vars <- c(                     # Housing tenure
+  b25003_total = "B25003_001",
+  owner_occ    = "B25003_002",
+  renter_occ   = "B25003_003"
+)
+
+# Employment (replacement for poverty)
+emp_vars <- c(
+  labor_force = "B23025_003",
+  unemployed  = "B23025_005"
+)
+
+# Combine all into one list
+all_vars <- c(core_vars, set_names(edu_vars, edu_vars), tenure_vars, emp_vars)
+```
+
+```{r get-bg-one-year-unemp}
+get_bg_one_year <- function(yr) {
+  message("Pulling ACS block-group data for year: ", yr)
+
+  bg <- get_acs(
+    geography = "block group",
+    variables = all_vars,
+    state = "IL",
+    county = "Cook",
+    year = yr,
+    geometry = TRUE
+  )
+
+  bg_wide <- bg %>%
+    rename_with(~tolower(.x)) %>%
+    select(geoid, name, variable, estimate, geometry) %>%
+    pivot_wider(names_from = variable, values_from = estimate) %>%
+    janitor::clean_names()
+
+
+  hs_cols <- paste0("b15003_", sprintf("%03d", 17:25))
+  ba_cols <- paste0("b15003_", sprintf("%03d", 22:25))
+
+
+  bg_wide <- bg_wide %>%
+    mutate(
+      edu_total = b15003_001,
+      hs_or_more_count = rowSums(across(all_of(hs_cols)), na.rm = TRUE),
+      bachelors_plus_count = rowSums(across(all_of(ba_cols)), na.rm = TRUE),
+      hs_or_more_pct = if_else(edu_total > 0, 100 * hs_or_more_count / edu_total, NA_real_),
+      bachelors_plus_pct = if_else(edu_total > 0, 100 * bachelors_plus_count / edu_total, NA_real_),
+      owner_occ_pct  = if_else(b25003_total > 0, 100 * owner_occ / b25003_total, NA_real_),
+      renter_occ_pct = if_else(b25003_total > 0, 100 * renter_occ / b25003_total, NA_real_),
+      unemployment_rate = if_else(labor_force > 0, 100 * unemployed / labor_force, NA_real_),
+      year = yr
+    )
+
+  return(bg_wide)
+}
+```
+
+```{r fg-summary-base-unemp}
+# Combine all ACS years
+acs_bg_all <- purrr::map_dfr(years, get_bg_one_year)
+
+# Attach community area codes
+ca_cross <- readxl::read_excel("OSNA_FINAL/2020 Census Tracts to Chicago Community Area Equivalency File.xlsx") %>%
+  janitor::clean_names()
+
+fg_all <- acs_bg_all %>%
+  mutate(tract11 = substr(geoid, 1, 11)) %>%
+  inner_join(
+    ca_cross %>% transmute(tract11 = as.character(geoid20), ca),
+    by = "tract11"
+  ) %>%
+  filter(ca == 12)
+
+# Drop geometry
+fg_df <- fg_all %>%
+  sf::st_drop_geometry() %>%
+  as.data.frame() %>%
+  filter(!is.na(total_pop) & total_pop > 0)
+
+# Summarize per ACS year (using proven base-R logic)
+summarize_one_year <- function(df, yr) {
+  df_year <- df %>% filter(year == yr)
+  data.frame(
+    year              = yr,
+    total_pop         = sum(df_year$total_pop, na.rm = TRUE),
+    median_age_pw     = weighted.mean(df_year$median_age, df_year$total_pop, na.rm = TRUE),
+    median_income_pw  = weighted.mean(df_year$median_income, df_year$total_pop, na.rm = TRUE),
+    hs_or_more_pw     = weighted.mean(df_year$hs_or_more_pct, df_year$total_pop, na.rm = TRUE),
+    bachelors_pw      = weighted.mean(df_year$bachelors_plus_pct, df_year$total_pop, na.rm = TRUE),
+    owner_occ_pw      = weighted.mean(df_year$owner_occ_pct, df_year$total_pop, na.rm = TRUE),
+    unemployment_pw   = weighted.mean(df_year$unemployment_rate, df_year$total_pop, na.rm = TRUE)
+  )
+}
+
+fg_summary_all <- do.call(rbind, lapply(sort(unique(fg_df$year)), function(y) summarize_one_year(fg_df, y)))
+
+fg_summary_all
+```
+
+```{r neighbors}
+target_ca <- 12
+neighbor_cas <- c(10, 11, 13, 14) 
+cas_of_interest <- c(target_ca, neighbor_cas)
+```
+```{r pull-2022}
+bg_2022 <- get_bg_one_year(2022)
+
+study_sf <- bg_2022 %>%
+  mutate(tract11 = substr(geoid, 1, 11)) %>%
+  inner_join(
+    ca_cross %>% transmute(tract11 = as.character(geoid20), ca),
+    by = "tract11"
+  ) %>%
+  filter(ca %in% cas_of_interest)
+
+nrow(study_sf)  # should be >= 60
+length(unique(study_sf$ca))
+```
+```{r features}
+library(units)
+
+study_sf <- study_sf %>%
+  mutate(
+    area_km2 = as.numeric(set_units(st_area(geometry), km^2)),
+    pop_density = ifelse(area_km2 > 0 & !is.na(area_km2), total_pop / area_km2, NA_real_)
+  )
+
+feat_cols <- c("median_age","median_income",
+               "hs_or_more_pct","bachelors_plus_pct",
+               "owner_occ_pct","unemployment_rate",
+               "pop_density")
+
+study_df <- study_sf %>%
+  sf::st_drop_geometry() %>%
+  select(geoid, ca, all_of(feat_cols)) %>%
+  mutate(across(all_of(feat_cols), ~as.numeric(as.character(.))))
+
+# Z-score features (keep NAs out)
+Z <- scale(study_df[, feat_cols])
+rownames(Z) <- study_df$geoid
+```
+```{r graph-edges}
+library(igraph)
+
+# --- Feature kNN (k = 8; tweak 6–12 if needed) ---
+k <- 8
+D <- as.matrix(dist(Z, method = "euclidean"))
+diag(D) <- Inf
+geos <- rownames(D)
+
+knn_pairs <- lapply(seq_len(nrow(D)), function(i){
+  nbr_idx <- order(D[i, ])[1:k]
+  data.frame(from = geos[i], to = geos[nbr_idx], w_feat = 1, stringsAsFactors = FALSE)
+})
+E_feat <- do.call(rbind, knn_pairs)
+
+# Make undirected by collapsing duplicates
+E_feat_u <- E_feat %>%
+  mutate(a = pmin(from,to), b = pmax(from,to)) %>%
+  distinct(a,b, .keep_all = TRUE) %>%
+  transmute(from = a, to = b, w_feat)
+
+# --- Spatial (Queen) adjacency ---
+touch_list <- sf::st_touches(study_sf)
+id_map <- setNames(study_sf$geoid, seq_len(nrow(study_sf)))
+spa_pairs <- do.call(rbind, lapply(seq_along(touch_list), function(i){
+  if (length(touch_list[[i]])==0) return(NULL)
+  data.frame(from = id_map[[i]], to = id_map[touch_list[[i]]],
+             w_spa = 1, stringsAsFactors = FALSE)
+}))
+E_spa_u <- spa_pairs %>%
+  mutate(a = pmin(from,to), b = pmax(from,to)) %>%
+  distinct(a,b, .keep_all = TRUE) %>%
+  transmute(from = a, to = b, w_spa)
+
+# --- Combine layers (alpha weights) ---
+alpha_feat <- 0.7; alpha_spa <- 0.3
+E_all <- full_join(E_feat_u, E_spa_u, by = c("from","to")) %>%
+  mutate(w_feat = ifelse(is.na(w_feat), 0, w_feat),
+         w_spa  = ifelse(is.na(w_spa),  0, w_spa),
+         weight = alpha_feat*w_feat + alpha_spa*w_spa) %>%
+  filter(weight > 0)
+
+# Build graph
+g <- graph_from_data_frame(E_all, directed = FALSE,
+                           vertices = study_df %>% select(geoid, ca))
+g
+```
+```{r communities-metrics}
+set.seed(42)
+cl <- cluster_louvain(g, weights = E(g)$weight)
+V(g)$cluster <- membership(cl)
+
+# Modularity
+mod <- modularity(g, membership = V(g)$cluster, weights = E(g)$weight)
+
+# Forest Glen "ground truth" set
+fg_nodes <- V(g)[V(g)$ca == target_ca]
+fg_cluster <- names(sort(table(V(g)$cluster[fg_nodes]), decreasing = TRUE))[1]
+fg_cluster <- as.integer(fg_cluster)
+
+# Purity: share of the chosen cluster that is actually CA 12
+cluster_nodes <- V(g)[V(g)$cluster == fg_cluster]
+purity <- sum(V(g)$ca[cluster_nodes] == target_ca) / length(cluster_nodes)
+
+# Coverage: share of CA 12 nodes captured by that cluster
+coverage <- sum(V(g)$cluster[fg_nodes] == fg_cluster) / length(fg_nodes)
+
+# Conductance of CA 12 as a set
+fg_set <- V(g)$name %in% V(g)$name[fg_nodes]
+```
+```{r map-clusters, fig.width=7, fig.height=6}
+plot_sf <- study_sf %>%
+  left_join(
+    data.frame(geoid = V(g)$name, cluster = V(g)$cluster),
+    by = "geoid"
+  )
+
+library(ggplot2)
+ggplot(plot_sf) +
+  geom_sf(aes(fill = factor(cluster)), color = "white", size = 0.15) +
+  geom_sf(data = subset(plot_sf, ca == target_ca), fill = NA, color = "black", size = 0.6) +
+  theme_minimal() +
+  labs(title = "Block-group communities (Louvain) — Forest Glen (outlined)",
+       fill = "Detected cluster")
+```
+```{r pca, fig.width=7, fig.height=5}
+X <- na.omit(as.data.frame(Z))  # rows used in kNN
+common_ids <- rownames(X)
+pca <- prcomp(X, center = TRUE, scale. = FALSE)
+
+vis_df <- data.frame(
+  geoid = common_ids,
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2]
+) %>%
+  left_join(study_df %>% select(geoid, ca), by = "geoid") %>%
+  left_join(data.frame(geoid = V(g)$name, cluster = V(g)$cluster), by = "geoid")
+
+ggplot(vis_df, aes(PC1, PC2, color = factor(cluster), shape = factor(ca == target_ca))) +
+  geom_point(size = 2) +
+  scale_shape_discrete(name = "Forest Glen?", labels = c("No","Yes")) +
+  theme_minimal() +
+  labs(title = "Feature-space structure (PCA of z-scored variables)",
+       color = "Detected cluster")
+```
+
+```{r}
+
+fg_ids   <- which(V(g)$ca == target_ca)
+rest_ids <- setdiff(seq_along(V(g)), fg_ids)
+EE <- ends(g, E(g), names = FALSE)  
+w  <- E(g)$weight
+in_fg_from <- EE[,1] %in% fg_ids
+in_fg_to   <- EE[,2] %in% fg_ids
+is_cut <- xor(in_fg_from, in_fg_to)
+cross_edge_count <- sum(is_cut)
+cross_weight     <- sum(w[is_cut], na.rm = TRUE)
+internal_edges   <- (!is_cut) & (in_fg_from & in_fg_to)
+internal_weight  <- sum(w[internal_edges], na.rm = TRUE)
+vol_fg   <- sum(strength(g, vids = fg_ids,   weights = w))
+vol_rest <- sum(strength(g, vids = rest_ids, weights = w))
+conductance_fg <- if (vol_fg > 0 && vol_rest > 0) cross_weight / min(vol_fg, vol_rest) else NA_real_
+library(igraph)
+g_fg <- induced_subgraph(g, vids = fg_ids)
+internal_density   <- edge_density(g_fg)                           # unweighted density
+avg_path_len_fg    <- suppressWarnings(mean_distance(g_fg))        # may be Inf if not connected
+clust_coeff_fg     <- suppressWarnings(transitivity(g_fg, type="average"))
+
+data.frame(
+  cross_edge_count = cross_edge_count,
+  cross_weight     = round(cross_weight, 3),
+  vol_fg           = round(vol_fg, 3),
+  vol_rest         = round(vol_rest, 3),
+  conductance      = round(conductance_fg, 4),
+  internal_weight  = round(internal_weight, 3),
+  internal_density = round(internal_density, 4),
+  avg_path_len_fg  = round(avg_path_len_fg, 3),
+  clustering_coef  = round(clust_coeff_fg, 4)
+)
+
+```
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(pheatmap)
+library(scales)
+library(sf)
+
+study_num <- study_sf %>%
+  sf::st_drop_geometry() %>%
+  select(geoid, ca, median_age, median_income,
+         hs_or_more_pct, bachelors_plus_pct,
+         owner_occ_pct, renter_occ_pct, total_pop)
+
+
+study_num <- study_num %>%
+  mutate(across(where(is.character), as.numeric))
+
+study_num <- study_num %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.infinite(.x) | is.nan(.x), NA, .x)))
+
+study_num <- study_num %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x)))
+
+
+summary(study_num)
+
+
+study_scaled <- scale(study_num %>%
+                        select(-geoid, -ca))
+
+
+row.names(study_scaled) <- study_num$geoid
+
+
+pca_res <- prcomp(study_scaled, scale = TRUE)
+
+
+fviz_eig(pca_res, addlabels = TRUE, barfill = "steelblue", barcolor = "black") +
+  labs(title = "Scree Plot: PCA Components Variance Explained")
+
+
+fviz_pca_biplot(pca_res,
+                geom.ind = "point",
+                habillage = as.factor(study_sf$ca),
+                addEllipses = TRUE,
+                ellipse.type = "confidence",
+                palette = "Dark2",
+                title = "PCA of Block Groups — Forest Glen and Neighbors") +
+  theme_minimal()
+
+dist_mat <- dist(study_scaled, method = "euclidean")
+similarity_mat <- as.matrix(1 / (1 + dist_mat))  # higher = more similar
+
+pheatmap(similarity_mat,
+         main = "Block-Group Similarity Heatmap (Forest Glen + Neighbors)",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         color = colorRampPalette(c("white", "navy"))(100))
+
+
+set.seed(42)
+
+sil_scores <- sapply(2:6, function(k) {
+  km <- kmeans(study_scaled, centers = k, nstart = 25)
+  ss <- silhouette(km$cluster, dist_mat)
+  mean(ss[, 3])
+})
+
+best_k <- which.max(sil_scores)
+plot(2:6, sil_scores, type = "b",
+     xlab = "Number of clusters (k)",
+     ylab = "Average silhouette width",
+     main = "Silhouette Analysis — Optimal k")
+
+best_k
+
+
+km_final <- kmeans(study_scaled, centers = best_k, nstart = 25)
+study_sf$cluster <- as.factor(km_final$cluster)
+
+fviz_cluster(km_final, data = study_scaled,
+             geom = "point",
+             habillage = study_sf$ca,
+             ellipse.type = "convex",
+             palette = "Dark2",
+             title = paste("K-Means Clustering (k =", best_k, ") — Forest Glen & Neighbors")) +
+  theme_minimal()
+
+
+fg_only <- study_sf %>% filter(ca == 12)
+fg_scaled <- study_scaled[row.names(study_scaled) %in% fg_only$geoid, ]
+
+fg_dist <- dist(fg_scaled)
+mean_fg_dist <- mean(as.numeric(fg_dist))
+sd_fg_dist <- sd(as.numeric(fg_dist))
+cohesion_index <- 1 / (1 + mean_fg_dist)
+
+data.frame(
+  mean_distance = round(mean_fg_dist, 3),
+  sd_distance = round(sd_fg_dist, 3),
+  cohesion_index = round(cohesion_index, 3)
+)
+```
+
+
+
+
